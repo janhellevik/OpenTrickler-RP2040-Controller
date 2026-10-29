@@ -100,6 +100,7 @@ target_link_libraries("${TARGET_NAME}"
     hardware_spi
     hardware_i2c
     hardware_pwm
+    pico_rand
     FreeRTOS-Kernel
     FreeRTOS-Kernel-Heap4
     u8g2

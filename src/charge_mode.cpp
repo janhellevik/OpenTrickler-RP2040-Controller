@@ -8,6 +8,8 @@
 #include <semphr.h>
 #include <u8g2.h>
 #include <math.h>
+#include "pico/rand.h"
+#include "pico/time.h"
 
 #include "app.h"
 #include "FloatRingBuffer.h"
@@ -64,6 +66,26 @@ static char title_string[30];
 
 static TickType_t charge_start_tick = 0;
 static float last_charge_elapsed_seconds = 0.0f;
+static uint8_t charge_profile_idx = 0;
+
+// Charge history: the last completed charges, kept in RAM only (no EEPROM wear)
+#define CHARGE_HISTORY_LEN              64
+#define CHARGE_HISTORY_MAX_ITEMS        16      // Per /rest/charge_history response
+#define CHARGE_HISTORY_ITEM_JSON_MAX    200     // Worst case, with %0.3f of the largest float
+
+typedef struct {
+    uint32_t seq;           // Monotonic from 1, per boot
+    uint32_t t_ms;          // Uptime when recorded
+    float target;
+    float weight;
+    float elapsed_s;
+    uint8_t profile_idx;
+    uint8_t event;          // CHARGE_MODE_EVENT_UNDER_CHARGE / CHARGE_MODE_EVENT_OVER_CHARGE, 0 when within threshold
+} charge_history_entry_t;
+
+static charge_history_entry_t charge_history[CHARGE_HISTORY_LEN];
+static uint32_t charge_history_last_seq = 0;    // 0 when nothing is recorded
+static uint32_t charge_history_boot_id = 0;     // Random per power-up, so clients can tell a reboot
 
 // Coarse trickler end-of-trickle backoff
 #define COARSE_STOP_BACKOFF_MAX_MS 15000  // safety cap
@@ -196,6 +218,24 @@ void scale_measurement_render_task(void *p) {
 }
 
 
+static void charge_history_record(float target, float weight, float elapsed_s, uint8_t profile_idx, uint8_t event) {
+    charge_history_entry_t entry;
+    entry.t_ms = to_ms_since_boot(get_absolute_time());
+    entry.target = target;
+    entry.weight = weight;
+    entry.elapsed_s = elapsed_s;
+    entry.profile_idx = profile_idx;
+    entry.event = event;
+
+    // The REST handler reads the buffer from the lwIP task, possibly on the other core
+    taskENTER_CRITICAL();
+    entry.seq = charge_history_last_seq + 1;
+    charge_history[(entry.seq - 1) % CHARGE_HISTORY_LEN] = entry;
+    charge_history_last_seq = entry.seq;
+    taskEXIT_CRITICAL();
+}
+
+
 void charge_mode_wait_for_zero() {
     // Set colour to not ready
     neopixel_led_set_colour(
@@ -249,6 +289,7 @@ void charge_mode_wait_for_zero() {
 void charge_mode_wait_for_complete() {
 
     charge_start_tick = xTaskGetTickCount();
+    charge_profile_idx = profile_get_selected_idx();
     coarse_backoff_in_progress = false;
 
     // Set colour to under charge
@@ -426,6 +467,7 @@ void charge_mode_wait_for_cup_removal() {
     // Take current measurement
     float current_measurement = scale_get_current_measurement();
     float error = charge_mode_config.target_charge_weight - current_measurement;
+    uint8_t charge_event = 0;
 
     // Update LED colour before moving to the next stage
     // Over charged
@@ -439,6 +481,7 @@ void charge_mode_wait_for_cup_removal() {
 
         // Set over charge
         charge_mode_config.charge_mode_event |= CHARGE_MODE_EVENT_OVER_CHARGE;
+        charge_event = CHARGE_MODE_EVENT_OVER_CHARGE;
     }
     // Under charged
     else if (error >= charge_mode_config.eeprom_charge_mode_data.fine_stop_threshold) {
@@ -451,6 +494,7 @@ void charge_mode_wait_for_cup_removal() {
 
         // Set under charge flag
         charge_mode_config.charge_mode_event |= CHARGE_MODE_EVENT_UNDER_CHARGE;
+        charge_event = CHARGE_MODE_EVENT_UNDER_CHARGE;
 
     }
     // Normal
@@ -465,6 +509,13 @@ void charge_mode_wait_for_cup_removal() {
         // Clear over and under charge bit
         charge_mode_config.charge_mode_event &= ~(CHARGE_MODE_EVENT_UNDER_CHARGE | CHARGE_MODE_EVENT_OVER_CHARGE);
     }
+
+    // Record the completed charge
+    charge_history_record(charge_mode_config.target_charge_weight,
+                          current_measurement,
+                          last_charge_elapsed_seconds,
+                          charge_profile_idx,
+                          charge_event);
 
     // Stop condition: 5 stable measurements in 300ms apart (1.5 seconds minimum)
     while (true) {
@@ -633,6 +684,8 @@ uint8_t charge_mode_menu(bool charge_mode_skip_user_input) {
 
 bool charge_mode_config_init(void) {
     bool is_ok = false;
+
+    charge_history_boot_id = get_rand_32();
 
     // Read charge mode config from EEPROM
     is_ok = load_config(EEPROM_CHARGE_MODE_BASE_ADDR, &charge_mode_config.eeprom_charge_mode_data, &default_charge_mode_data, sizeof(charge_mode_config.eeprom_charge_mode_data), EEPROM_CHARGE_MODE_DATA_REV);
@@ -856,6 +909,102 @@ bool http_rest_charge_mode_state(struct fs_file *file, int num_params, char *par
 
     size_t data_length = strlen(charge_mode_json_buffer);
     file->data = charge_mode_json_buffer;
+    file->len = data_length;
+    file->index = data_length;
+    file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
+
+    return true;
+}
+
+
+// Writes a weight like /rest/charge_mode_state does: "nan" and "inf" as strings
+static void weight_to_json(char * buf, size_t len, float weight) {
+    if (isnanf(weight)) {
+        snprintf(buf, len, "\"nan\"");
+    }
+    else if (isinff(weight)) {
+        snprintf(buf, len, "\"inf\"");
+    }
+    else {
+        snprintf(buf, len, "%0.3f", weight);
+    }
+}
+
+
+bool http_rest_charge_history(struct fs_file *file, int num_params, char *params[], char *values[]) {
+    // Mappings
+    // since (uint32_t): only return charges with a seq after this one (default 0)
+    //
+    // Response
+    // boot (uint32_t): random id per power-up; seq restarts from 1 when it changes
+    // next (uint32_t): pass as since on the next call (the last returned seq, or the newest seq when nothing is returned)
+    // items (list): up to 16 charges, oldest first, with seq, t_ms, target, weight, elapsed_s, profile_idx and event
+
+    static char charge_history_json_buffer[128 + CHARGE_HISTORY_MAX_ITEMS * CHARGE_HISTORY_ITEM_JSON_MAX];
+    uint32_t since = 0;
+
+    for (int idx = 0; idx < num_params; idx += 1) {
+        if (strcmp(params[idx], "since") == 0 && values[idx] != NULL) {
+            since = strtoul(values[idx], NULL, 10);
+        }
+    }
+
+    // Copy out the requested entries while the charge task can't write
+    static charge_history_entry_t items[CHARGE_HISTORY_MAX_ITEMS];
+    uint32_t item_count = 0;
+    uint32_t last_seq;
+
+    taskENTER_CRITICAL();
+    last_seq = charge_history_last_seq;
+    if (since < last_seq) {
+        uint32_t oldest_seq = (last_seq > CHARGE_HISTORY_LEN) ? last_seq - CHARGE_HISTORY_LEN + 1 : 1;
+        uint32_t seq = (since < oldest_seq) ? oldest_seq : since + 1;
+
+        for (; seq <= last_seq && item_count < CHARGE_HISTORY_MAX_ITEMS; seq += 1) {
+            items[item_count++] = charge_history[(seq - 1) % CHARGE_HISTORY_LEN];
+        }
+    }
+    taskEXIT_CRITICAL();
+
+    uint32_t next = item_count > 0 ? items[item_count - 1].seq : last_seq;
+
+    // Response
+    size_t buf_len = sizeof(charge_history_json_buffer);
+    int written = snprintf(charge_history_json_buffer, buf_len,
+                           "%s"
+                           "{\"boot\":%lu,\"next\":%lu,\"items\":[",
+                           http_json_header,
+                           charge_history_boot_id,
+                           next);
+    size_t pos = written > 0 ? (size_t) written : 0;
+
+    for (uint32_t idx = 0; idx < item_count && pos < buf_len; idx += 1) {
+        const charge_history_entry_t * item = &items[idx];
+        char target_string[48];
+        char weight_string[48];
+
+        weight_to_json(target_string, sizeof(target_string), item->target);
+        weight_to_json(weight_string, sizeof(weight_string), item->weight);
+
+        written = snprintf(&charge_history_json_buffer[pos], buf_len - pos,
+                           "%s{\"seq\":%lu,\"t_ms\":%lu,\"target\":%s,\"weight\":%s,\"elapsed_s\":%0.2f,\"profile_idx\":%u,\"event\":%u}",
+                           idx == 0 ? "" : ",",
+                           item->seq,
+                           item->t_ms,
+                           target_string,
+                           weight_string,
+                           item->elapsed_s,
+                           (unsigned) item->profile_idx,
+                           (unsigned) item->event);
+        pos += written > 0 ? (size_t) written : 0;
+    }
+
+    if (pos < buf_len) {
+        snprintf(&charge_history_json_buffer[pos], buf_len - pos, "]}");
+    }
+
+    size_t data_length = strlen(charge_history_json_buffer);
+    file->data = charge_history_json_buffer;
     file->len = data_length;
     file->index = data_length;
     file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
