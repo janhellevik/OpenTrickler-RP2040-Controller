@@ -938,9 +938,10 @@ bool http_rest_charge_history(struct fs_file *file, int num_params, char *params
     // Response
     // boot (uint32_t): random id per power-up; seq restarts from 1 when it changes
     // next (uint32_t): pass as since on the next call (the last returned seq, or the newest seq when nothing is returned)
+    // now_ms (uint32_t): uptime when the response was made, to turn the items' t_ms into wall-clock time
     // items (list): up to 16 charges, oldest first, with seq, t_ms, target, weight, elapsed_s, profile_idx and event
 
-    static char charge_history_json_buffer[128 + CHARGE_HISTORY_MAX_ITEMS * CHARGE_HISTORY_ITEM_JSON_MAX];
+    static char charge_history_json_buffer[160 + CHARGE_HISTORY_MAX_ITEMS * CHARGE_HISTORY_ITEM_JSON_MAX];
     uint32_t since = 0;
 
     for (int idx = 0; idx < num_params; idx += 1) {
@@ -972,10 +973,11 @@ bool http_rest_charge_history(struct fs_file *file, int num_params, char *params
     size_t buf_len = sizeof(charge_history_json_buffer);
     int written = snprintf(charge_history_json_buffer, buf_len,
                            "%s"
-                           "{\"boot\":%lu,\"next\":%lu,\"items\":[",
+                           "{\"boot\":%lu,\"next\":%lu,\"now_ms\":%lu,\"items\":[",
                            http_json_header,
                            charge_history_boot_id,
-                           next);
+                           next,
+                           to_ms_since_boot(get_absolute_time()));
     size_t pos = written > 0 ? (size_t) written : 0;
 
     for (uint32_t idx = 0; idx < item_count && pos < buf_len; idx += 1) {

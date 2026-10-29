@@ -25,8 +25,11 @@ bool http_404_error(struct fs_file *file, int num_params, char *params[], char *
 
     file->data = "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n"
                  "{\"error\":404}";
-    file->len = 13;
-    file->index = 13;
+
+    // The length covers the header too, which is part of the data
+    size_t len = strlen(file->data);
+    file->len = len;
+    file->index = len;
     file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
 
     return true;

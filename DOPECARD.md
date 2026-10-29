@@ -66,7 +66,7 @@ Writing to a slot also selects it, as before.
 Returns the completed charges recorded after `since`, at most 16 per response, oldest first:
 
 ```json
-{"boot":3735928559,"next":42,"items":[
+{"boot":3735928559,"next":42,"now_ms":1260480,"items":[
  {"seq":41,"t_ms":1234567,"target":42.000,"weight":42.020,"elapsed_s":11.37,"profile_idx":2,"event":0},
  {"seq":42,"t_ms":1251012,"target":42.000,"weight":42.060,"elapsed_s":10.92,"profile_idx":2,"event":4}]}
 ```
@@ -77,6 +77,7 @@ Returns the completed charges recorded after `since`, at most 16 per response, o
 |---|---|
 | `boot` | A random 32-bit id, new at every power-up. When it changes, the trickler has rebooted, its history is gone and `seq` starts again from 1. |
 | `next` | What to pass as `since` on the next call: the last returned `seq`, or the newest recorded `seq` when nothing is returned. |
+| `now_ms` | Uptime in ms when the response was made. With it, an item's wall-clock time is the receive time minus `now_ms - t_ms`. |
 | `items` | The charges, oldest first. |
 
 **Item fields:**
@@ -124,10 +125,10 @@ For example:
 
 Each write selects slot 7. To leave the selection as it was, select the old slot again afterwards.
 
-On this firmware and on stock firmware, an unknown path such as `/rest/profile_read` on stock gets
-a truncated reply: 13 bytes (`HTTP/1.1 404 `) and then the connection closes. A client that probes
-for these endpoints must therefore treat a parse error or a closed connection as "not supported".
-A clean 404 never comes.
+On stock firmware, an unknown path such as `/rest/profile_read` gets a truncated reply: 13 bytes
+(`HTTP/1.1 404 `) and then the connection closes, because `http_404_error` sets `len = 13`. A
+client that probes for these endpoints must therefore treat a parse error or a closed connection
+as "not supported". This fork sends the whole response: `404 Not Found` with `{"error":404}`.
 
 ## EEPROM: profile data rev 2
 
